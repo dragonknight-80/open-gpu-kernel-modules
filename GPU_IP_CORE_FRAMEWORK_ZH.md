@@ -29,15 +29,67 @@
 
 > 注意：开源内核模块不等于公开全部硬件微架构细节。这里是“驱动职责视角”的 IP 映射。
 
-### 2.1 GPC / TPC / SM（图形与计算执行核心）
+### 2.1 GPC / TPC / SM（图形与计算执行核心）- 深入版
 
-- 典型职责：graphics/compute 提交、上下文、调度策略（部分逻辑在固件/GSP）。
-- 代码关注点：
-  - `src/nvidia/` 中 RM 相关资源管理和通道管理；
-  - 与 UVM 的 VA 空间、迁移、fault 处理协同。
-- 重点分析问题：
-  - 用户态队列/命令流如何进入内核？
-  - 上下文切换与抢占错误如何上报？
+#### 2.1.1 这个 IP 在驱动中的“可见边界”
+
+- GPC/TPC/SM 本身是执行阵列，内核模块里**更多体现为“通道、上下文、虚拟地址空间、故障恢复”**，而不是直接暴露“某个 SM 寄存器逐条编程”。
+- 在本仓库里，你看到的是：
+  - 设备文件/ioctl 入口 -> 资源对象管理；
+  - 命令提交通道和同步对象；
+  - GPU fault / MMU fault 的回传与恢复；
+  - 与 UVM 的地址空间协同。
+
+#### 2.1.2 建议先看的文件（函数级分析前的最小集合）
+
+- 内核接口总入口与设备管理：
+  - `kernel-open/nvidia/nv.c`
+  - `kernel-open/nvidia/nv-linux.c`
+  - `kernel-open/nvidia/nv-frontend.c`
+- ioctl 与对象/控制路径：
+  - `kernel-open/nvidia/nv-ioctl.c`
+  - `kernel-open/nvidia/nv-mmap.c`
+- OS-agnostic RM 主体（执行核心的资源抽象主要在这里）：
+  - `src/nvidia/src/kernel/rmapi/`
+  - `src/nvidia/src/kernel/gpu/`
+  - `src/nvidia/src/kernel/mem_mgr/`
+- UVM 协同：
+  - `kernel-open/nvidia-uvm/uvm.c`
+  - `kernel-open/nvidia-uvm/uvm_va_space.c`
+  - `kernel-open/nvidia-uvm/uvm_gpu.c`
+
+#### 2.1.3 控制流（GPC/TPC/SM 视角）
+
+可按下面链路追踪：
+
+1. 用户态 CUDA/OpenGL/Vulkan 触发提交。
+2. 通过字符设备/ioctl 进入 `kernel-open/nvidia/`。
+3. RM 将提交映射到“通道/上下文/地址空间/同步对象”。
+4. 命令由前端与调度路径下发到 GPU 执行阵列（GPC/TPC/SM）。
+5. 完成/异常通过中断、事件、fence 回传。
+6. 若 fault：走 UVM / RM fault handler，决定重试、迁移、回收或 reset。
+
+#### 2.1.4 数据流（GPC/TPC/SM 视角）
+
+1. 用户态 buffer/command buffer 建立。
+2. 内核 pin + map（CPU VA -> GPU VA）。
+3. GPC/TPC/SM 通过统一地址空间取指/取数。
+4. 结果写回显存或系统内存。
+5. 同步对象（fence/semaphore/event）通知用户态。
+
+#### 2.1.5 重点故障模型（建议逐条验证）
+
+- **地址翻译相关**：GPU page fault、invalid PTE、权限位冲突。
+- **上下文相关**：上下文切换超时、通道卡死、抢占失败。
+- **同步相关**：fence 不完成、semaphore 失配。
+- **恢复相关**：engine reset 之后对象一致性丢失。
+
+#### 2.1.6 GPC/TPC/SM 深挖执行清单（可直接开工）
+
+1. 建一张“ioctl -> RM 对象 -> 提交通道 -> 中断回调”时序图。
+2. 建一张“UVM fault -> 迁移/映射更新 -> 重放提交”时序图。
+3. 按 GPU 架构代际（Turing/Ampere/Hopper/Blackwell）比对同类路径差异。
+4. 整理 10 个常见错误日志模式及定位手册。
 
 ### 2.2 Copy Engine (CE)
 
@@ -119,7 +171,22 @@
   - 哪些敏感操作在内核模块中做权限门控；
   - ioctl capability 检查和对象句柄校验。
 
-## 3. 以“数据流 + 控制流”双轴分析每个 IP Core
+## 3. 模块到 IP Core 的初始映射表（含文件路径）
+
+> 这是第一版“可执行地图”：用于快速确定你该去哪一层、哪个目录追踪某个 IP 行为。
+
+| 模块 / 产物 | 主要目录 | 对应 IP Core | 你先看的文件（最小集合） | 备注 |
+|---|---|---|---|---|
+| `nvidia.ko` 内核接口层 | `kernel-open/nvidia/` | GPC/TPC/SM、Memory/MMU、中断/恢复、安全门控 | `nv.c`, `nv-linux.c`, `nv-frontend.c`, `nv-ioctl.c`, `nv-mmap.c` | 计算/图形核心入口最关键 |
+| `nvidia.ko` OS-agnostic 层 | `src/nvidia/` | GPC/TPC/SM 抽象、RM 对象模型、内存管理 | `src/kernel/rmapi/`, `src/kernel/gpu/`, `src/kernel/mem_mgr/` | 核心逻辑浓度最高 |
+| `nvidia-uvm.ko` | `kernel-open/nvidia-uvm/` | Unified Memory、GPU fault/migration、VA 协同 | `uvm.c`, `uvm_gpu.c`, `uvm_va_space.c`, `uvm_migrate.c` | AI/HPC 重点路径 |
+| `nvidia-modeset.ko` 内核接口层 | `kernel-open/nvidia-modeset/` | Display pipeline（head/window/flip/vblank） | `nvidia-modeset-linux.c`, `nvkms-ioctl.h` | Linux 侧 glue |
+| `nvidia-modeset.ko` OS-agnostic 层 | `src/nvidia-modeset/` | Display 核心状态机、DP/HDMI、VRR、颜色管理 | `src/nvkms-modeset.c`, `src/nvkms-flip.c`, `src/nvkms-dpy.c`, `src/dp/` | 显示分析主战场 |
+| `nvidia-drm.ko` | `kernel-open/nvidia-drm/` | DRM/KMS 接口、原子提交、connector/encoder/crtc | `nvidia-drm-drv.c`, `nvidia-drm-modeset.c`, `nvidia-drm-connector.c`, `nvidia-drm-crtc.c` | 与 Linux 图形栈对接核心 |
+| `nvidia-peermem.ko` | `kernel-open/nvidia-peermem/` | CE 数据搬运相关、P2P/RDMA 映射 | `nvidia-peermem.c`, `nv-p2p.h` | 高性能网络与 GPU 互联关键 |
+| 固件抽取工具 | `nouveau/` | GSP firmware 边界、固件布局 | `extract-firmware-nouveau.py`, `extract-firmware-nouveau.txt` | 用于理解 host/firmware 边界 |
+
+## 4. 以“数据流 + 控制流”双轴分析每个 IP Core
 
 对每个 IP core 都画两张图：
 
@@ -134,7 +201,7 @@
 - reset/recover path
 - teardown path
 
-## 4. 建议的“源码阅读顺序”（高效）
+## 5. 建议的“源码阅读顺序”（高效）
 
 1. `README.md`：明确模块边界与构建产物。
 2. `Makefile`、`kernel-open/*/*.Kbuild`：看目标模块与对象文件关系。
@@ -144,7 +211,7 @@
 6. `kernel-open/nvidia/` + `src/nvidia/`：RM 主体，覆盖通道/对象/内存/中断。
 7. `kernel-open/nvidia-peermem/`：CE/P2P/RDMA 专项。
 
-## 5. 面向落地的“IP Core 分析清单”（你可以直接照抄用）
+## 6. 面向落地的“IP Core 分析清单”（你可以直接照抄用）
 
 每个 IP core 建一个 markdown（例如 `analysis/ip-display.md`），按以下小节：
 
@@ -159,24 +226,17 @@
 9. 常见 bug 模式
 10. 复现实验与日志抓取命令
 
-## 6. 建议优先深挖的 IP（按收益排序）
+## 7. 建议优先深挖的 IP（按收益排序）
 
 1. **Display（含 DP/HDMI）**：代码公开度高，最容易建立端到端认知。
 2. **Memory + UVM**：对 AI/HPC 场景价值最高。
 3. **CE + peermem**：和 RDMA/P2P 直接相关。
 4. **GSP 边界**：决定“哪些事情在内核，哪些在固件”。
 
-## 7. 你可以如何使用这个框架（两周计划）
+## 8. 你可以如何使用这个框架（两周计划）
 
 - **第 1-2 天**：完成模块总图（nvidia / modeset / drm / uvm / peermem）。
 - **第 3-5 天**：完成 Display IP（含 DP link training 与 flip/vblank）闭环。
 - **第 6-8 天**：完成 UVM + Memory fault/migrate 闭环。
 - **第 9-10 天**：完成 CE/peermem 闭环。
 - **第 11-14 天**：补齐异常恢复、性能与调试手册。
-
----
-
-如果你愿意，我下一步可以基于这个框架，直接给你产出一版：
-
-1) **“模块到 IP Core 的初始映射表（含文件路径）”**，以及
-2) **Display IP 的第一份详细剖析（函数级时序）**。
